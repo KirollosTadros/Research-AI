@@ -4,7 +4,7 @@ A multi-agent research assistant built with **LangGraph** and **Google Gemini**.
 
 1. **Clarify** the question with you if it's vague (human-in-the-loop),
 2. **Plan** the research by breaking the question into focused sub-questions,
-3. **Research** every sub-question **in parallel** with a separate researcher agent for each,
+3. **Research** every sub-question **in parallel** with a separate researcher agent for each, which searches the web with **Tavily** when it needs facts,
 4. **Write** a structured markdown report from the combined findings.
 
 It runs as a chat-style **Streamlit** web app or as a command-line tool, and everything runs inside **Docker**.
@@ -15,12 +15,13 @@ It runs as a chat-style **Streamlit** web app or as a command-line tool, and eve
 
 | Feature | How it's built |
 |---|---|
-| Multi-agent pipeline | Four specialised agents (clarifier, planner, researcher, writer), each a LangGraph node with its own prompt and output schema |
+| Multi-agent pipeline | Four specialised agents (clarifier, planner, researcher, writer), each a LangGraph node with its own prompt and responsibility |
 | Parallel research | LangGraph's `Send` API starts one researcher per sub-question at the same time |
+| Tool-using agents | Each researcher is a LangGraph **subgraph** with a tool-calling loop (`bind_tools` + `ToolNode` + `tools_condition`). The model decides when to call `web_search` |
 | Merging parallel results | An `operator.add` reducer on the state combines the findings from all researchers |
 | Human-in-the-loop | `interrupt()` pauses the graph to ask the user a question, and `Command(resume=...)` continues the same run |
 | Persistent runs | A checkpointer (`InMemorySaver`) and a `thread_id` let a paused run pick up exactly where it stopped |
-| Reliable LLM output | Every agent uses Pydantic structured output instead of parsing free text |
+| Reliable LLM output | The clarifier, planner and writer use Pydantic structured output instead of parsing free text |
 | Live progress | `graph.stream(stream_mode="updates")` shows each agent's progress in the UI as it happens |
 | Model selection | Choose the Gemini model from the UI; the whole graph is built for that model |
 
@@ -44,12 +45,23 @@ flowchart TD
     writer --> END
 ```
 
+Each **researcher** is its own subgraph, a tool-calling agent loop:
+
+```mermaid
+flowchart LR
+    S([START]) --> agent
+    agent -- "model called web_search" --> tools["tools<br/>(ToolNode → Tavily)"]
+    tools --> agent
+    agent -- "no tool call: answer ready" --> finish
+    finish --> E([END])
+```
+
 | Node | Role | Reads | Writes |
 |---|---|---|---|
 | `clarifier` | Decides whether the question is clear enough to research | `question`, `clarification_rounds` | `clarifying_question`, `clarification_rounds`, or `report` (when it gives up) |
 | `ask_human` | Pauses the graph and waits for the user's answer | `clarifying_question` | `question` (with the Q&A appended) |
 | `planner` | Breaks the question into independent sub-questions | `question` | `sub_questions` |
-| `researcher` | Answers one sub-question; N copies run in parallel | `sub_question` (its own input) | `findings` (merged with the reducer) |
+| `researcher` | Subgraph agent that answers one sub-question, searching the web as needed; N copies run in parallel | `sub_question` (its own input) | `findings` (merged with the reducer) |
 | `writer` | Writes the final report, using only the findings | `question`, `findings` | `report` |
 
 ---
@@ -84,6 +96,29 @@ graph.add_conditional_edges("planner", dispatch_researchers, ["researcher"])
 
 Each researcher gets a small, private input (`ResearcherState`) and returns `{"findings": [one_finding]}`. The `operator.add` reducer adds these lists together, so all the findings arrive intact even though the researchers finish at the same time and in any order.
 
+### Tool-calling researcher subgraph
+
+Each researcher is a compiled `StateGraph` added to the main graph as a single node, so `Send` can start many copies of it. Inside, it runs the standard LangGraph agent loop:
+
+```python
+@tool
+def web_search(query: str) -> str:
+    """Search the web for up-to-date information. Returns the top results with their URLs."""
+    ...  # Tavily search, formatted as title / URL / content
+
+graph = StateGraph(ResearcherAgentState, input_schema=ResearcherState, output_schema=ResearcherOutput)
+graph.add_node("agent", self.agent)                 # LLM with bind_tools([web_search])
+graph.add_node("tools", ToolNode([web_search]))     # runs whatever tool calls the LLM made
+graph.add_node("finish", self.finish)               # turns the final answer into a finding
+graph.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: "finish"})
+graph.add_edge("tools", "agent")
+```
+
+- **The model decides.** `tools_condition` checks the LLM's last message: if it has tool calls, the loop goes to `tools`, otherwise to `finish`. Simple questions are answered without searching; factual ones trigger one or more searches.
+- **Private message history.** The subgraph keeps its own `messages` list (with the `add_messages` reducer). Its `output_schema` returns only `findings` to the parent, so the search transcripts never clutter the main state.
+- **Search budget.** After `MAX_SEARCH_ROUNDS` (3) rounds of tool calls, the model is told to answer from the results it has, and any further tool calls are dropped in code. This caps latency and API usage.
+- **Grounded answers.** The prompt requires a `Sources:` list with only URLs from the search results, and the writer carries them into the report's Sources section.
+
 ### Fan-in
 
 LangGraph runs in steps. Every researcher started in the same step must finish before the next step starts, so the edge `researcher → writer` runs the writer **once**, with all the findings already merged.
@@ -106,7 +141,7 @@ def ask_human(state: ResearchState) -> dict:
 
 ### Structured output
 
-Each agent binds a Pydantic schema to the LLM with `with_structured_output(...)`. For example, the planner returns `QuestionBreakdown(sub_questions: list[str])` and the clarifier returns `Clarification(needs_clarification: bool, clarifying_question: str)`. This gives typed, validated data that the routing functions can rely on.
+The clarifier, planner and writer bind a Pydantic schema to the LLM with `with_structured_output(...)`. For example, the planner returns `QuestionBreakdown(sub_questions: list[str])` and the clarifier returns `Clarification(needs_clarification: bool, clarifying_question: str)`. This gives typed, validated data that the routing functions can rely on.
 
 ---
 
@@ -116,12 +151,12 @@ Each agent binds a Pydantic schema to the LLM with `with_structured_output(...)`
 .
 ├── app.py               # Graph definition (nodes, edges, routing) + CLI entry point
 ├── streamlit_app.py     # Chat-style web UI with streaming progress and HITL
-├── state.py             # ResearchState (shared) and ResearcherState (per worker)
+├── state.py             # ResearchState (shared) + researcher subgraph states
 ├── nodes/
 │   ├── llm.py           # Shared Gemini client factory + list of available models
 │   ├── clarifier.py     # Clarifier agent + ask_human (interrupt) node
 │   ├── planner.py       # Planner agent
-│   ├── researcher.py    # Researcher agent (runs in parallel)
+│   ├── researcher.py    # web_search tool + researcher subgraph (tool loop, runs in parallel)
 │   └── writer.py        # Writer agent
 ├── Dockerfile
 ├── requirements.txt
@@ -136,6 +171,7 @@ Each agent binds a Pydantic schema to the LLM with `with_structured_output(...)`
 
 - [Docker](https://docs.docker.com/get-docker/)
 - A Google Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+- A Tavily API key from [tavily.com](https://tavily.com) (the free tier includes 1,000 searches a month)
 
 ### 1. Clone the project and add your API key
 
@@ -145,10 +181,11 @@ cd Research-AI
 cp .env.example .env
 ```
 
-Open `.env` and replace the placeholder with your key:
+Open `.env` and replace the placeholders with your keys:
 
 ```
 GEMINI_API_KEY=your-gemini-api-key-here
+TAVILY_API_KEY=your-tavily-api-key-here
 ```
 
 ### 2. Build the Docker image
@@ -213,6 +250,7 @@ The terminal shows each agent's work as it happens, including the parallel resea
 - **[LangGraph](https://langchain-ai.github.io/langgraph/)**: graph orchestration, parallel runs, checkpointing, interrupts
 - **[LangChain Google GenAI](https://python.langchain.com/docs/integrations/chat/google_generative_ai/)**: Gemini chat models with structured output
 - **Google Gemini**: the LLM behind every agent (the model can be chosen in the UI)
+- **Tavily**: web search API for the researcher agents
 - **Pydantic**: output schemas for each agent
 - **Streamlit**: chat web interface
 - **Docker**: reproducible Python 3.10 environment
@@ -221,7 +259,7 @@ The terminal shows each agent's work as it happens, including the parallel resea
 
 ## Limitations & Roadmap
 
-- **No web search yet.** The researchers answer from the model's own knowledge, and their prompts tell them to say "I don't know" rather than guess. Adding a search tool to each researcher (a ReAct-style tool loop) is the next planned step.
+- **Search quality depends on the snippets.** Researchers read Tavily's result snippets, not full web pages, so detailed questions may get shallow answers. Fetching full pages for the top results would improve this.
 - **Checkpoints are kept in memory.** Paused runs are lost when the app restarts. Swapping `InMemorySaver` for `SqliteSaver` or `PostgresSaver` would make them last.
 - **Planned: a review loop.** A reviewer node would check the findings for gaps and send the run back to the planner, using the `iterations` field as the limit.
 - **Planned: memory between questions.** Each question currently starts a fresh run, so follow-up questions don't know about earlier ones.

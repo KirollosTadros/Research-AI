@@ -34,7 +34,7 @@ def build_graph(model: str = DEFAULT_MODEL):
     graph.add_node("clarifier", clarifier.clarify)
     graph.add_node("ask_human", ask_human)
     graph.add_node("planner", planner.plan)
-    graph.add_node("researcher", researcher.research)
+    graph.add_node("researcher", researcher.graph)
     graph.add_node("writer", writer.write)
 
     graph.add_edge(START, "clarifier")

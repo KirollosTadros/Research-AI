@@ -24,6 +24,8 @@ class Writer:
         prompt = f"""You are the writer in a research agent.
 Using only the research findings below, write a clear, well-structured
 report in markdown that answers the user's question.
+Cite sources inline where relevant and end with a "Sources" section listing
+the URLs from the findings.
 
 Question: {state["question"]}
 
